@@ -17,11 +17,12 @@
 
 package dadb
 
+import dadb.adbserver.AdbServer
 import dadb.forwarding.TcpForwarder
-import okio.*
 import java.io.File
-import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
+import okio.*
 
 interface Dadb : AutoCloseable {
 
@@ -75,9 +76,18 @@ interface Dadb : AutoCloseable {
 
     @Throws(IOException::class)
     fun install(file: File, vararg options: String) {
-        if (supportsFeature("abb_exec")) {
-            abbExec("package", "install", "-S", file.length().toString(), *options).use { stream ->
-                stream.sink.writeAll(file.source())
+        if (supportsFeature("cmd")) {
+            install(file.source(), file.length(), *options)
+        } else {
+            pmInstall(file, *options)
+        }
+    }
+
+    @Throws(IOException::class)
+    fun install(source: Source, size: Long, vararg options: String) {
+        if (supportsFeature("cmd")) {
+            execCmd("package", "install", "-S", size.toString(), *options).use { stream ->
+                stream.sink.writeAll(source)
                 stream.sink.flush()
                 val response = stream.source.readString(Charsets.UTF_8)
                 if (!response.startsWith("Success")) {
@@ -85,18 +95,27 @@ interface Dadb : AutoCloseable {
                 }
             }
         } else {
-            val fileName = file.name
-            val remotePath = "/data/local/tmp/$fileName"
-            push(file, remotePath)
-            shell("pm install ${options.joinToString(" ")} \"$remotePath\"")
+            val tempFile = kotlin.io.path.createTempFile()
+            val fileSink = tempFile.sink().buffer()
+            fileSink.writeAll(source)
+            fileSink.flush()
+            pmInstall(tempFile.toFile(), *options)
         }
     }
 
+    private fun pmInstall(file: File, vararg options: String) {
+        val fileName = file.name
+        val remotePath = "/data/local/tmp/$fileName"
+        push(file, remotePath)
+        shell("pm install ${options.joinToString(" ")} \"$remotePath\"")
+    }
+
+    @Throws(IOException::class)
     fun installMultiple(apks: List<File>, vararg options: String) {
         // http://aospxref.com/android-12.0.0_r3/xref/packages/modules/adb/client/adb_install.cpp#538
-        if (supportsFeature("abb_exec")) {
+        if (supportsFeature("cmd")) {
             val totalLength = apks.map { it.length() }.reduce { acc, l ->  acc + l }
-            abbExec("package", "install-create", "-S", totalLength.toString(), *options).use { createStream ->
+            execCmd("package", "install-create", "-S", totalLength.toString(), *options).use { createStream ->
                 val response = createStream.source.readString(Charsets.UTF_8)
                 if (!response.startsWith("Success")) {
                     throw IOException("connect error for create: $response")
@@ -104,40 +123,79 @@ interface Dadb : AutoCloseable {
                 val pattern = """\[(\w+)]""".toRegex()
                 val sessionId = pattern.find(response)?.groups?.get(1)?.value ?: throw IOException("failed to create session")
 
-                var success = true
+                var error: String? = null
                 apks.forEach { apk->
                     // install write every apk file to stream
-                    abbExec("package", "install-write", "-S", apk.length().toString(), sessionId, apk.name, "-", *options).use { writeStream->
+                    execCmd("package", "install-write", "-S", apk.length().toString(), sessionId, apk.name, "-", *options).use { writeStream->
                         writeStream.sink.writeAll(apk.source())
                         writeStream.sink.flush()
 
                         val writeResponse = writeStream.source.readString(Charsets.UTF_8)
                         if (!writeResponse.startsWith("Success")) {
-                            success = false
+                            error = writeResponse
                             return@forEach
                         }
                     }
                 }
 
                 // commit the session
-                val finalCommand = if (success) "install-commit" else "install-abandon"
-                abbExec("package", finalCommand, sessionId, *options).use { commitStream->
+                val finalCommand = if (error == null) "install-commit" else "install-abandon"
+                execCmd("package", finalCommand, sessionId, *options).use { commitStream->
                     val finalResponse = commitStream.source.readString(Charsets.UTF_8)
                     if (!finalResponse.startsWith("Success")) {
                         throw IOException("failed to finalize session: $commitStream")
                     }
                 }
+
+                if (error != null) {
+                    throw IOException("Install failed: $error")
+                }
             }
         } else {
+            val totalLength = apks.map { it.length() }.reduce { acc, l ->  acc + l }
+            // step1: create session
+            val response = shell("pm install-create -S $totalLength ${options.joinToString(" ")}")
+            if (!response.allOutput.startsWith("Success")) {
+                throw IOException("pm create session failed: $response")
+            }
+
+            val pattern = """\[(\w+)]""".toRegex()
+            val sessionId = pattern.find(response.allOutput)?.groups?.get(1)?.value ?: throw IOException("failed to create session")
+            var error: String? = null
+
             val fileNames = apks.map { it.name }
             val remotePaths = fileNames.map { "/data/local/tmp/$it" }
 
-            apks.zip(remotePaths) { apk, path ->
-                push(apk, path)
+            // step2: write apk to the session
+            apks.zip(remotePaths).forEachIndexed { index, pair ->
+                val apk = pair.first
+                val remotePath = pair.second
+
+                try {
+                    // we should push the apk files to device, when push failed, it would stop the installation
+                    push(apk, remotePath)
+                } catch (t: IOException) {
+                    error = t.message
+                    return@forEachIndexed
+                }
+
+                // pm install-write -S APK_SIZE SESSION_ID INDEX PATH
+                val writeResponse = shell("pm install-write -S ${apk.length()} $sessionId $index $remotePath")
+                if (!writeResponse.allOutput.startsWith("Success")) {
+                    error = writeResponse.allOutput
+                    return@forEachIndexed
+                }
             }
 
-            val installPath = remotePaths.joinToString(" ")
-            shell("pm install ${options.joinToString(" ")} $installPath")
+            // step3: commit or abandon the session
+            val finalCommand = if (error == null) "pm install-commit $sessionId" else "pm install-abandon $sessionId"
+            val finalResponse = shell(finalCommand)
+            if (!finalResponse.allOutput.startsWith("Success")) {
+                throw IOException("failed to finalize session: $finalResponse")
+            }
+            if (error != null) {
+                throw IOException("Install failed: $error");
+            }
         }
     }
 
@@ -147,6 +205,13 @@ interface Dadb : AutoCloseable {
         if (response.exitCode != 0) {
             throw IOException("Uninstall failed: ${response.allOutput}")
         }
+    }
+
+    @Throws(IOException::class)
+    fun execCmd(vararg command: String): AdbStream {
+        if (!supportsFeature("cmd")) throw UnsupportedOperationException("cmd is not supported on this version of Android")
+        val destination = (listOf("exec:cmd") + command).joinToString(" ")
+        return open(destination)
     }
 
     @Throws(IOException::class)
@@ -189,19 +254,33 @@ interface Dadb : AutoCloseable {
 
         @JvmStatic
         @JvmOverloads
-        fun create(host: String, port: Int, keyPair: AdbKeyPair? = AdbKeyPair.readDefault()): Dadb = DadbImpl(host, port, keyPair)
+        fun create(host: String, port: Int, keyPair: AdbKeyPair? = AdbKeyPair.readDefault(), connectTimeout: Int = 0, socketTimeout: Int = 0): Dadb = DadbImpl(host, port, keyPair, connectTimeout, socketTimeout)
 
         @JvmStatic
         @JvmOverloads
-        fun discover(host: String, keyPair: AdbKeyPair? = AdbKeyPair.readDefault()): Dadb? {
-            (MIN_EMULATOR_PORT .. MAX_EMULATOR_PORT).forEach { port ->
-                val dadb = create(host, port, keyPair)
-                try {
-                    val response = dadb.shell("echo success")
-                    if (response.allOutput == "success\n") return dadb
-                } catch (ignore : Throwable) {}
+        fun discover(host: String = "localhost", keyPair: AdbKeyPair? = AdbKeyPair.readDefault(), connectTimeout: Int = 0, socketTimeout: Int = 0): Dadb? {
+            return list(host, keyPair, connectTimeout, socketTimeout).firstOrNull()
+        }
+
+        @JvmStatic
+        @JvmOverloads
+        fun list(host: String = "localhost", keyPair: AdbKeyPair? = AdbKeyPair.readDefault(), connectTimeout: Int = 0, socketTimeout: Int = 0): List<Dadb> {
+            val dadbs = AdbServer.listDadbs(adbServerHost = host)
+            if (dadbs.isNotEmpty()) return dadbs
+
+            return (MIN_EMULATOR_PORT .. MAX_EMULATOR_PORT).mapNotNull { port ->
+                val dadb = create(host, port, keyPair, socketTimeout, connectTimeout)
+                val response = try {
+                    dadb.shell("echo success").allOutput
+                } catch (ignore : Throwable) {
+                    null
+                }
+                if (response == "success\n") {
+                    dadb
+                } else {
+                    null
+                }
             }
-            return null
         }
 
         private fun waitRootOrClose(dadb: Dadb, root: Boolean) {

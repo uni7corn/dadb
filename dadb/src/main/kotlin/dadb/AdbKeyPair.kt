@@ -70,8 +70,8 @@ class AdbKeyPair(
 
         @JvmStatic
         fun readDefault(): AdbKeyPair {
-            val privateKeyFile = File(System.getenv("HOME"), ".android/adbkey")
-            val publicKeyFile = File(System.getenv("HOME"), ".android/adbkey.pub")
+            val privateKeyFile = File(System.getProperty("user.home"), ".android/adbkey")
+            val publicKeyFile = File(System.getProperty("user.home"), ".android/adbkey.pub")
 
             if (!privateKeyFile.exists()) {
                 generate(privateKeyFile, publicKeyFile)
@@ -99,6 +99,9 @@ class AdbKeyPair(
                 it.initialize(KEY_LENGTH_BITS)
                 it.genKeyPair()
             }
+
+            privateKeyFile.absoluteFile.parentFile?.mkdirs()
+            publicKeyFile.absoluteFile.parentFile?.mkdirs()
 
             privateKeyFile.writer().use { out ->
                 val base64 = Base64.getMimeEncoder(64, "\n".toByteArray())
